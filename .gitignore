@@ -188,3 +188,7 @@ Qt*-linux*.tar.*
 .tool-versions
 .python-version
 !tools/.python-version
+
+# QlaudeGC
+__pycache__/
+*.pyc

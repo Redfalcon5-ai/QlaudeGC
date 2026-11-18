@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/tar/qml">
+        <file alias="RouterIndicator.qml">res/qml/RouterIndicator.qml</file>
+        <file alias="RouterIndicatorPage.qml">res/qml/RouterIndicatorPage.qml</file>
+        <file alias="RouterConfigDialog.qml">res/qml/RouterConfigDialog.qml</file>
+        <file alias="AssistantIndicator.qml">res/qml/AssistantIndicator.qml</file>
+        <file alias="AssistantPanel.qml">res/qml/AssistantPanel.qml</file>
+    </qresource>
+    <qresource prefix="/tar/router">
+        <file alias="main.conf">res/router/main.conf</file>
+    </qresource>
+</RCC>

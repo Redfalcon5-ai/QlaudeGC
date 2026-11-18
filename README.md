@@ -1,63 +1,86 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Dronecode/UX-Design/35d8148a8a0559cd4bcf50bfa2c94614983cce91/QGC/Branding/Deliverables/QGC_RGB_Logo_Horizontal_Positive_PREFERRED/QGC_RGB_Logo_Horizontal_Positive_PREFERRED.svg" alt="QGroundControl Logo" width="500">
-</p>
+# QlaudeGC
 
-<p align="center">
-  <a href="https://github.com/mavlink/QGroundControl/releases"><img src="https://img.shields.io/github/v/release/mavlink/QGroundControl" alt="Latest Release"></a>
-  <a href="https://github.com/mavlink/qgroundcontrol/blob/master/.github/COPYING.md"><img src="https://img.shields.io/github/license/mavlink/QGroundControl" alt="License"></a>
-  <a href="https://github.com/mavlink/QGroundControl/actions/workflows/linux.yml"><img src="https://github.com/mavlink/QGroundControl/actions/workflows/linux.yml/badge.svg" alt="Linux Build"></a>
-  <a href="https://securityscorecards.dev/viewer/?uri=github.com/mavlink/qgroundcontrol"><img src="https://img.shields.io/ossf-scorecard/github.com/mavlink/qgroundcontrol?label=openssf%20scorecard" alt="OpenSSF Scorecard"></a>
-  <a href="https://crowdin.com/project/qgroundcontrol"><img src="https://badges.crowdin.net/qgroundcontrol/localized.svg" alt="Crowdin"></a>
-  <a href="https://discord.com/channels/1022170275984457759/1022185820683255908"><img src="https://img.shields.io/discord/1022170275984457759?logo=discord&logoColor=white&label=Discord" alt="Dronecode Discord"></a>
-  <a href="https://doi.org/10.5281/zenodo.595404"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.595404.svg" alt="DOI"></a>
-</p>
+**QlaudeGC** is a custom build of [QGroundControl](https://github.com/mavlink/qgroundcontrol). It adds two things to QGC:
 
-**QGroundControl** (QGC) is a Ground Control Station (GCS) for UAVs, providing full flight control
-and mission planning for any *MAVLink-enabled* drone, including *PX4* and *ArduPilot* platforms.
+- a **built-in MAVLink router**, so other programs can share QGC's vehicle connection;
+- a **Claude chat sidebar** that can see the live vehicle state and, after you approve each change, adjust parameters, app settings and comm links.
+
+All of the custom code is in [`custom/`](custom/) and uses QGC's standard custom-build plugin mechanism (`QGCCorePlugin`). The rest of the tree is upstream QGC, unchanged, so updating to a newer QGC is a normal merge from `mavlink/qgroundcontrol`.
+
+Detailed documentation: [`custom/README.md`](custom/README.md).
+
+---
 
 ## Features
 
-- **Mission planning** — plan, edit, and fly autonomous waypoint, survey, and structure-scan missions.
-- **Live Fly View** — real-time flight display with map, instruments, and full vehicle telemetry.
-- **Vehicle setup** — guided wizards for sensor calibration, radio, flight modes, and power.
-- **Parameter tuning** — inspect and edit every vehicle parameter through the Fact System.
-- **Video streaming** — GStreamer-based UDP RTP / RTSP video with recording in the Flight Display.
-- **Multi-vehicle** — connect to and monitor multiple vehicles simultaneously.
-- **MAVLink tooling** — built-in MAVLink Inspector, console, and log download/analysis.
-- **Cross-platform** — Windows, macOS, Linux, Android, and iOS from a single codebase.
+### Built-in MAVLink router
 
-## Download
+- **Router compiled into QGC.** It runs on its own thread, so UI stalls never delay traffic.
+- **mavlink-router compatible.** It reads mavlink-router's `main.conf` format: `[UdpEndpoint]` (Server/Normal), `[TcpEndpoint]`, `[UartEndpoint]`, `[General] TcpServerPort`, and `AllowMsgIdOut` / `BlockMsgIdOut` message filters. Existing mavlink-router configs can be imported as they are.
+- **Same routing rules as mavlink-router.**
+  - Messages with a target system go only to endpoints that have seen that system.
+  - Broadcasts go everywhere except back to the source.
+  - Frames are forwarded byte-for-byte, so signed frames pass through.
+- **QGC keeps its own links.** Every QGC link (e.g. the drone on UDP 14550, telemetry radios) is bridged into the router. Out of the box, MAVSDK can connect on `udp://:14540` and other tools on the TCP server at port 5760 (mavproxy, a second QGC, ...).
+- **Multiple vehicles.**
+  - Per-endpoint vehicle filters (`AllowSrcSysOut` / `BlockSrcSysOut`) restrict an endpoint to chosen system ids.
+  - A **MAVSDK per vehicle** button adds one endpoint per connected vehicle at UDP `14540 + sysid`.
+  - Several MAVSDK instances can share GCS id 245.
+- **Graphical config editor.** It covers endpoints, ports, serial settings, message filters and the TCP server port. It also has **Import...**, which validates a file and makes it the active config, and **Export active config...**.
+- **Toolbar indicator.** It shows traffic, the number of active endpoints and config errors at a glance. Click it for per-endpoint rx/tx rates, the system ids heard on each endpoint, CRC errors, the enable switch and the log.
+- **`tar_router_cli`.** The same router engine as a standalone console program. `--check file.conf` validates a config.
 
-Grab the latest stable build for your platform, or see all assets on the
-[releases page](https://github.com/mavlink/QGroundControl/releases/latest):
+### Claude chat sidebar
 
-<p align="center">
-  <a href="https://github.com/mavlink/QGroundControl/releases/latest/download/QGroundControl-installer.exe"><img src="https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white" alt="Windows"></a>
-  <a href="https://github.com/mavlink/QGroundControl/releases/latest/download/QGroundControl.dmg"><img src="https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white" alt="macOS"></a>
-  <a href="https://github.com/mavlink/QGroundControl/releases/latest/download/QGroundControl-x86_64.AppImage"><img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black" alt="Linux (AppImage)"></a>
-  <a href="https://github.com/mavlink/QGroundControl/releases/latest/download/QGroundControl.apk"><img src="https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white" alt="Android"></a>
-</p>
+- **Chat panel inside QGC.** Click the chat-bubble icon in the toolbar to open it. It runs the locally installed [Claude Code](https://claude.com/claude-code) CLI. Conversations persist and can be resumed.
+- **Live context.** Each message carries a snapshot of QGC's state, which can be previewed or turned off:
+  - every vehicle's mode, armed and flying state, prearm errors, GPS, batteries, altitude, position and recent messages;
+  - router status and the log tail.
+- **Built-in MCP server (`qgc`).** It listens on localhost and needs a per-launch token. It gives Claude tools to:
+  - list vehicles, and search and read parameters with full metadata (units, ranges, defaults, enums, bitmasks, reboot-required);
+  - **set parameters**, after checking type and range;
+  - search, read and change **QGC app settings** (video, units, maps, fly/plan view, auto-connect, MAVLink, RTK, ADS-B, joystick, logging, ...);
+  - create, edit, connect, disconnect and delete **comm links**;
+  - inspect and call QGC's live object tree (`qgc_inspect`, `qgc_set_property`, `qgc_call`) for anything else.
+- **Every change needs your approval.** An approval card shows old → new values, Claude's reason and warnings (vehicle armed or flying, reboot needed). Nothing is sent until you click **Approve**. Reject, Stop or a 10-minute timeout leaves the vehicle unchanged.
+- **Safety limits.** Arming, flight-mode changes and other vehicle commands are not exposed. Shell tools are always blocked. Access to files is read-only by default, with an optional "can edit files" mode.
+- **Quality of life.** Up/Down recalls messages you sent, Claude Code slash commands work (`/goal`, `/cost`, ...), and you can pick the model and working folder.
 
-## Links
+---
 
-- [Official Website](http://qgroundcontrol.com)
-- [User Manual](https://docs.qgroundcontrol.com/en/)
-- [Developer Guide](https://dev.qgroundcontrol.com/en/) / [Build Instructions](https://dev.qgroundcontrol.com/en/getting_started/)
-- [Discussion & Support](https://docs.qgroundcontrol.com/en/Support/Support.html)
-- [Dronecode Discord](https://discord.com/channels/1022170275984457759/1022185820683255908)
-- [Security Policy](.github/SECURITY.md)
-- [Code of Conduct](.github/CODE_OF_CONDUCT.md)
-- [License](https://github.com/mavlink/qgroundcontrol/blob/master/.github/COPYING.md)
+## Building (Windows)
 
-## Contributing
+Requirements:
 
-QGC is open source and welcomes contributions. See [AGENTS.md](AGENTS.md) for build/test/lint
-commands and coding conventions, and [.github/CONTRIBUTING.md](.github/CONTRIBUTING.md) for
-architecture patterns and the contribution workflow.
+- Visual Studio 2022 Build Tools (C++)
+- Qt 6.11.1 `msvc2022_64` in `C:\Qt` (e.g. via aqtinstall)
+- `cmake` and `ninja` from pip
 
-QGC's interface is translated by the community — help translate it into your language on
-[Crowdin](https://crowdin.com/project/qgroundcontrol).
+Commands:
 
-## Star history
+```bat
+tar-build.bat            :: configure + build (RelWithDebInfo)
+tar-build.bat build      :: incremental build
+tar-target.bat <target>  :: build a single target, e.g. tar_router_cli
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=mavlink/qgroundcontrol&type=Date)](https://star-history.com/#mavlink/qgroundcontrol&Date)
+Output: `QlaudeGC.exe` and `tar_router_cli.exe` under `build\`.
+
+For the chat sidebar, install Claude Code and sign in once by running `claude` in a terminal.
+
+### Tests
+
+```bat
+python custom\test\router_test.py build\tar_router_cli.exe     :: router engine (CLI)
+python custom\test\multi_vehicle_test.py build\tar_router_cli.exe
+python custom\test\qgc_bridge_test.py                          :: against the running app
+python custom\test\qgc_param_tools_test.py                     :: MCP parameter tools (with fake_px4_params.py)
+```
+
+---
+
+## Upstream
+
+QlaudeGC is a fork of [mavlink/qgroundcontrol](https://github.com/mavlink/qgroundcontrol). For general QGC usage, see the [QGC user guide](https://docs.qgroundcontrol.com/master/en/qgc-user-guide/). For building on other platforms, see the [QGC developer guide](https://docs.qgroundcontrol.com/master/en/qgc-dev-guide/).
+
+QGroundControl and QlaudeGC are dual-licensed under Apache 2.0 and GPLv3. See [`.github/COPYING.md`](.github/COPYING.md).
