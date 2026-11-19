@@ -5,6 +5,8 @@
         <file alias="RouterConfigDialog.qml">res/qml/RouterConfigDialog.qml</file>
         <file alias="AssistantIndicator.qml">res/qml/AssistantIndicator.qml</file>
         <file alias="AssistantPanel.qml">res/qml/AssistantPanel.qml</file>
+        <file alias="BagRecorderIndicator.qml">res/qml/BagRecorderIndicator.qml</file>
+        <file alias="BagRecorderIndicatorPage.qml">res/qml/BagRecorderIndicatorPage.qml</file>
     </qresource>
     <qresource prefix="/tar/router">
         <file alias="main.conf">res/router/main.conf</file>

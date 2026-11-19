@@ -1,0 +1,8 @@
+[Unit]
+Description=QGC bag disk guard (%i)
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/qgc-bagctl guard --session %i
+Restart=on-failure
+RestartSec=5

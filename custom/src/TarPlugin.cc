@@ -10,6 +10,7 @@
 
 #include "QGCLoggingCategory.h"
 #include "TarAssistant.h"
+#include "TarBagRecorder.h"
 #include "TarRouter.h"
 
 QGC_LOGGING_CATEGORY(TarPluginLog, "Custom.TarPlugin")
@@ -20,6 +21,7 @@ TarPlugin::TarPlugin(QObject *parent)
     : QGCCorePlugin(parent)
     , _router(new TarRouter(this))
     , _assistant(new TarAssistant(_router, this))
+    , _bagRecorder(new TarBagRecorder(this))
 {
     qCDebug(TarPluginLog) << this;
 }
@@ -34,10 +36,12 @@ void TarPlugin::init()
     QGCCorePlugin::init();
     // Defer until the event loop runs so LinkManager has finished its own startup.
     QTimer::singleShot(0, _router, &TarRouter::init);
+    QTimer::singleShot(0, _bagRecorder, &TarBagRecorder::init);
 }
 
 void TarPlugin::cleanup()
 {
+    _bagRecorder->shutdown();   // only local ssh/scp helpers; the Jetson recording keeps running
     _router->shutdown();
     QGCCorePlugin::cleanup();
 }
@@ -47,6 +51,7 @@ QQmlApplicationEngine *TarPlugin::createQmlApplicationEngine(QObject *parent)
     QQmlApplicationEngine *engine = QGCCorePlugin::createQmlApplicationEngine(parent);
     engine->rootContext()->setContextProperty(QStringLiteral("tarRouter"), _router);
     engine->rootContext()->setContextProperty(QStringLiteral("tarAssistant"), _assistant);
+    engine->rootContext()->setContextProperty(QStringLiteral("tarBagRecorder"), _bagRecorder);
     return engine;
 }
 
@@ -80,6 +85,7 @@ const QVariantList &TarPlugin::toolBarIndicators()
     static const QVariantList indicators = []() {
         QVariantList list = QGCCorePlugin::instance()->QGCCorePlugin::toolBarIndicators();
         list.prepend(QVariant::fromValue(QUrl::fromUserInput(QStringLiteral("qrc:/tar/qml/RouterIndicator.qml"))));
+        list.prepend(QVariant::fromValue(QUrl::fromUserInput(QStringLiteral("qrc:/tar/qml/BagRecorderIndicator.qml"))));
         list.prepend(QVariant::fromValue(QUrl::fromUserInput(QStringLiteral("qrc:/tar/qml/AssistantIndicator.qml"))));
         return list;
     }();

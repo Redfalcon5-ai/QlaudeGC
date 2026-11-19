@@ -5,6 +5,7 @@
 #include "QGCCorePlugin.h"
 
 class TarAssistant;
+class TarBagRecorder;
 class TarRouter;
 class QQmlApplicationEngine;
 
@@ -31,4 +32,5 @@ public:
 private:
     TarRouter *_router = nullptr;
     TarAssistant *_assistant = nullptr;
+    TarBagRecorder *_bagRecorder = nullptr;
 };
