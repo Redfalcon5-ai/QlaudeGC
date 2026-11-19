@@ -33,6 +33,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Assistant/TarMcpObjects.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Assistant/TarMcpServer.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Assistant/TarMcpServer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/BagRecorder/TarBagRecorder.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/BagRecorder/TarBagRecorder.h
     ${TAR_ROUTER_SOURCES}
     CACHE INTERNAL "" FORCE
 )
@@ -41,6 +43,7 @@ set(CUSTOM_INCLUDE_DIRECTORIES
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Router
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Assistant
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/BagRecorder
     CACHE INTERNAL "" FORCE
 )
 

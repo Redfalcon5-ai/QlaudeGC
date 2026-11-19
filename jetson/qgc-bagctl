@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""qgc-bagctl - control a persistent ROS 2 bag recording on the Jetson (used by QlaudeGC over SSH).
+
+Commands (all print ONE JSON object on stdout, diagnostics go to stderr, non-zero exit on failure):
+  doctor   --json                 check ROS setup, systemd user manager, linger, disk, bag root
+  start    --json                 start options as JSON on stdin; starts a systemd --user service
+  status   --json                 active session (or latest one) with state derived from systemd
+  stop     --id ID --json         graceful stop (SIGINT via systemd), idempotent
+  list     --json                 all known sessions
+  manifest --id ID [--sha256] --json   file list of a finalized bag (for verified download)
+  run      --session ID           private: systemd ExecStart entry point (execs ros2 bag record)
+  guard    --session ID           private: stop recording before the disk fills
+
+States: idle, starting, recording, stopping, finalized, failed.
+Python 3 standard library only.
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{0,32}$")
+SAFE_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
+UNIT_PREFIX = "qgc-rosbag@"
+GUARD_UNIT_PREFIX = "qgc-bag-guard@"
+MAX_REGEX_LEN = 2000
+STOP_HEADROOM_BYTES = 1024 ** 3
+
+STATE_DIR = os.path.expanduser(os.environ.get("QGC_BAGCTL_STATE", "~/.local/state/qgc-bagctl"))
+CONFIG_PATH = os.path.expanduser(os.environ.get("QGC_BAGCTL_CONFIG", "~/.config/qgc-bagctl/config.json"))
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+
+DEFAULT_CONFIG = {
+    "bag_root": "~/rosbags",
+    "ros_setup": [],            # e.g. ["/opt/ros/<ROS_DISTRO>/setup.bash", "/home/<USER>/<WS>/install/setup.bash"]
+    "env": {},                  # e.g. {"ROS_DOMAIN_ID": "<id>", "RMW_IMPLEMENTATION": "<rmw>"}
+    "min_free_bytes": 5 * 1024 ** 3,
+    "extra_record_args": [],    # e.g. ["--storage", "mcap"]; only used if you set it, rosbag2 defaults otherwise
+    "stop_timeout_s": 120,
+}
+
+
+class CtlError(Exception):
+    def __init__(self, code, message, exit_code=2):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.exit_code = exit_code
+
+
+def log(msg):
+    print("qgc-bagctl: " + msg, file=sys.stderr)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- config / helpers
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+        except (OSError, ValueError) as e:
+            raise CtlError("config_invalid", "cannot read %s: %s" % (CONFIG_PATH, e))
+        if not isinstance(user, dict):
+            raise CtlError("config_invalid", "%s must contain a JSON object" % CONFIG_PATH)
+        cfg.update(user)
+    cfg["bag_root"] = os.path.realpath(os.path.expanduser(str(cfg["bag_root"])))
+    if not SAFE_PATH_RE.match(cfg["bag_root"]):
+        raise CtlError("config_invalid", "bag_root %r contains characters outside [A-Za-z0-9_./-]" % cfg["bag_root"])
+    for key in ("ros_setup", "extra_record_args"):
+        if not isinstance(cfg[key], list) or not all(isinstance(x, str) for x in cfg[key]):
+            raise CtlError("config_invalid", "%s must be a list of strings" % key)
+    if not isinstance(cfg["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in cfg["env"].items()):
+        raise CtlError("config_invalid", "env must be an object of strings")
+    return cfg
+
+
+def check_session_id(sid):
+    if not isinstance(sid, str) or not SESSION_RE.match(sid):
+        raise CtlError("bad_session_id", "session id must match [A-Za-z0-9_-]{1,96}")
+    return sid
+
+
+def session_dir(sid):
+    return os.path.join(SESSIONS_DIR, check_session_id(sid))
+
+
+def bag_path_for(cfg, sid):
+    p = os.path.join(cfg["bag_root"], "qgc-" + check_session_id(sid))
+    # Defence in depth: the result must stay directly below bag_root.
+    if os.path.dirname(os.path.realpath(p)) != cfg["bag_root"]:
+        raise CtlError("path_escape", "bag path escapes bag root")
+    return p
+
+
+def read_manifest(sid):
+    try:
+        with open(os.path.join(session_dir(sid), "manifest.json"), "r", encoding="utf-8") as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_manifest(sid, m):
+    d = session_dir(sid)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, "manifest.json.%d.%s.tmp" % (os.getpid(), secrets.token_hex(4)))
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(d, "manifest.json"))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def all_sessions():
+    out = []
+    try:
+        names = sorted(os.listdir(SESSIONS_DIR))
+    except OSError:
+        return out
+    for n in names:
+        if SESSION_RE.match(n):
+            m = read_manifest(n)
+            if m and m.get("session_id") == n:
+                out.append(m)
+    return out
+
+
+def free_bytes(path):
+    p = path
+    while not os.path.exists(p) and p != "/":
+        p = os.path.dirname(p)
+    st = os.statvfs(p)
+    return st.f_bavail * st.f_frsize
+
+
+def dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except OSError:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------- systemd
+def systemctl(*args, check=False):
+    try:
+        r = subprocess.run(["systemctl", "--user"] + list(args), capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        raise CtlError("no_systemd", "systemctl not found; systemd is required")
+    except subprocess.TimeoutExpired:
+        raise CtlError("systemd_timeout", "systemctl timed out")
+    if check and r.returncode != 0:
+        raise CtlError("systemd_error", "systemctl --user %s failed: %s" % (" ".join(args), (r.stderr or r.stdout).strip()))
+    return r
+
+
+def unit_name(sid):
+    return "%s%s.service" % (UNIT_PREFIX, check_session_id(sid))
+
+
+def guard_unit_name(sid):
+    return "%s%s.service" % (GUARD_UNIT_PREFIX, check_session_id(sid))
+
+
+def unit_info(sid):
+    r = systemctl("show", unit_name(sid), "-p", "ActiveState", "-p", "SubState", "-p", "Result",
+                  "-p", "ExecMainStatus", "-p", "LoadState")
+    info = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            info[k] = v
+    return info
+
+
+def unit_is_live(info):
+    return info.get("ActiveState") in ("active", "activating", "deactivating", "reloading")
+
+
+# ---------------------------------------------------------------- bag finalization check
+def bag_finalized(bag_path):
+    """A bag is finalized when metadata.yaml exists and every file it lists exists. Returns (ok, reason)."""
+    meta = os.path.join(bag_path, "metadata.yaml")
+    if not os.path.isdir(bag_path):
+        return False, "bag directory does not exist"
+    if not os.path.isfile(meta):
+        return False, "metadata.yaml is missing (recorder did not finalize the bag)"
+    try:
+        with open(meta, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        return False, "cannot read metadata.yaml: %s" % e
+    if "rosbag2_bagfile_information" not in text:
+        return False, "metadata.yaml is not a rosbag2 metadata file"
+    listed = re.findall(r"^\s*-\s*([A-Za-z0-9_./-]+\.(?:db3|mcap)(?:\.zstd)?)\s*$", text, re.MULTILINE)
+    # Fall back to "path:" entries of files list (rosbag2 format varies by distro).
+    listed += re.findall(r"^\s*path:\s*([A-Za-z0-9_./-]+\.(?:db3|mcap)(?:\.zstd)?)\s*$", text, re.MULTILINE)
+    if not listed:
+        return False, "metadata.yaml lists no bag files"
+    for rel in set(listed):
+        full = os.path.realpath(os.path.join(bag_path, rel))
+        if os.path.dirname(full) != os.path.realpath(bag_path) or not os.path.isfile(full):
+            return False, "bag file listed in metadata is missing: %s" % rel
+    return True, ""
+
+
+# ---------------------------------------------------------------- state derivation
+def resolve(cfg, m):
+    """Derive the real state of a session from systemd + filesystem, persist transitions, return public dict."""
+    sid = m["session_id"]
+    bag = m.get("bag_path", "")
+    state = m.get("state", "failed")
+    last_error = m.get("last_error", "")
+    terminal = state in ("finalized", "failed")
+
+    if not terminal:
+        info = unit_info(sid)
+        live = unit_is_live(info)
+        if live:
+            if m.get("stop_requested"):
+                state = "stopping"
+            elif os.path.isdir(bag):
+                state = "recording"       # only claim recording once the recorder created its output
+            else:
+                state = "starting"
+                age = time.time() - m.get("started_epoch", time.time())
+                if age > 60:
+                    last_error = "recorder is running but created no bag after %ds (no topics / ROS setup?)" % int(age)
+        else:
+            ok, reason = bag_finalized(bag)
+            if m.get("stop_requested") and ok:
+                state = "finalized"
+                last_error = ""
+            elif ok:
+                state = "failed"
+                last_error = "recorder exited without a stop request (bag has metadata); exit result: %s" % info.get("Result", "?")
+            else:
+                state = "failed"
+                if m.get("stop_requested"):
+                    last_error = "stop completed but bag is incomplete: " + reason
+                else:
+                    last_error = ("recorder is not running (crash, ROS setup error or Jetson reboot); "
+                                  "systemd result: %s, exit status: %s; %s" %
+                                  (info.get("Result", "unknown"), info.get("ExecMainStatus", "?"), reason))
+                    tail = read_log_tail(sid)
+                    if tail:
+                        last_error += " | log: " + tail
+            if m.get("state") != state or m.get("last_error", "") != last_error:
+                m["state"] = state
+                m["last_error"] = last_error
+                m["ended_at"] = m.get("ended_at") or now_iso()
+                m["bag_finalized"] = bool(state == "finalized")
+                write_manifest(sid, m)
+    return {
+        "session_id": sid,
+        "state": state,
+        "bag_path": bag,
+        "started_at": m.get("started_at", ""),
+        "ended_at": m.get("ended_at", ""),
+        "exclude_regex": m.get("exclude_regex", ""),
+        "vehicle_label": m.get("vehicle_label", ""),
+        "finalized": state == "finalized",
+        "size_bytes": dir_size(bag) if os.path.isdir(bag) else 0,
+        "last_error": last_error,
+    }
+
+
+def read_log_tail(sid, n=400):
+    try:
+        with open(os.path.join(session_dir(sid), "recorder.log"), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode("utf-8", "replace").strip().replace("\n", " / ")
+    except OSError:
+        return ""
+
+
+def active_session(cfg):
+    for m in reversed(all_sessions()):
+        r = resolve(cfg, m)
+        if r["state"] in ("starting", "recording", "stopping"):
+            return r
+    return None
+
+
+# ---------------------------------------------------------------- commands
+def cmd_doctor(_args):
+    cfg = load_config()
+    checks = []
+
+    def add(name, ok, detail, fatal=True):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail, "fatal": fatal})
+
+    add("python3", True, sys.version.split()[0])
+    r = None
+    try:
+        r = systemctl("show-environment")
+        add("systemd_user_manager", r.returncode == 0,
+            "ok" if r.returncode == 0 else "cannot reach `systemctl --user` (%s). Is XDG_RUNTIME_DIR set / linger enabled?" % r.stderr.strip())
+    except CtlError as e:
+        add("systemd_user_manager", False, e.message)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    try:
+        lr = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True, timeout=10)
+        linger = "Linger=yes" in lr.stdout
+        add("linger", linger, "enabled" if linger else "disabled: run `sudo loginctl enable-linger %s`, otherwise "
+            "recording stops when your last login session ends" % user)
+    except (OSError, subprocess.SubprocessError):
+        add("linger", False, "loginctl unavailable", fatal=False)
+    unit_path = os.path.expanduser("~/.config/systemd/user/qgc-rosbag@.service")
+    add("systemd_unit", os.path.isfile(unit_path), unit_path if os.path.isfile(unit_path) else "missing: install %s" % unit_path)
+    guard_path = os.path.expanduser("~/.config/systemd/user/qgc-bag-guard@.service")
+    add("disk_guard_unit", os.path.isfile(guard_path), guard_path if os.path.isfile(guard_path) else "missing: install %s" % guard_path)
+    add("ros_setup_configured", bool(cfg["ros_setup"]), "ros_setup=%s" % cfg["ros_setup"] if cfg["ros_setup"]
+        else "no ros_setup in %s" % CONFIG_PATH)
+    for f in cfg["ros_setup"]:
+        add("ros_setup_file", os.path.isfile(f), f if os.path.isfile(f) else "missing: " + f)
+    ros2 = None
+    try:
+        env = build_env(cfg)
+        ros2 = shutil.which("ros2", path=env.get("PATH"))
+        add("ros2_cli", ros2 is not None, ros2 or "ros2 not found after sourcing ros_setup")
+        add("ros_domain_id", True, env.get("ROS_DOMAIN_ID", "(unset, default 0)"), fatal=False)
+        add("rmw_implementation", True, env.get("RMW_IMPLEMENTATION", "(unset, distro default)"), fatal=False)
+    except CtlError as e:
+        add("ros_environment", False, e.message)
+    root = cfg["bag_root"]
+    try:
+        os.makedirs(root, exist_ok=True)
+        probe = os.path.join(root, ".qgc-write-test-%d" % os.getpid())
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        add("bag_root_writable", True, root)
+    except OSError as e:
+        add("bag_root_writable", False, "%s: %s" % (root, e))
+    try:
+        fb = free_bytes(root)
+        required = cfg["min_free_bytes"] + STOP_HEADROOM_BYTES
+        add("disk_space", fb >= required, "%d bytes free (minimum %d)" % (fb, required))
+    except OSError as e:
+        add("disk_space", False, str(e))
+    ok = all(c["ok"] or not c["fatal"] for c in checks)
+    return {"ok": ok, "checks": checks, "bag_root": root, "config_path": CONFIG_PATH}, (0 if ok else 1)
+
+
+def build_env(cfg):
+    """Environment after sourcing the configured ROS setup files (done in bash, no user data in the script)."""
+    env = dict(os.environ)
+    if cfg["ros_setup"]:
+        script = 'for f in "$@"; do source "$f" || exit 97; done; env -0'
+        try:
+            r = subprocess.run(["bash", "-c", script, "qgc-bagctl"] + cfg["ros_setup"],
+                               capture_output=True, timeout=60, env=env)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise CtlError("ros_env_failed", "cannot run bash to source ROS setup: %s" % e)
+        if r.returncode != 0:
+            raise CtlError("ros_env_failed", "sourcing ROS setup failed (exit %d): %s" %
+                           (r.returncode, r.stderr.decode("utf-8", "replace").strip()[:300]))
+        env = {}
+        for item in r.stdout.split(b"\0"):
+            if b"=" in item:
+                k, v = item.split(b"=", 1)
+                env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    env.update(cfg["env"])
+    return env
+
+
+def cmd_start(_args):
+    cfg = load_config()
+    try:
+        opts = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        raise CtlError("bad_request", "stdin must be a JSON object")
+    if not isinstance(opts, dict):
+        raise CtlError("bad_request", "stdin must be a JSON object")
+    regex = opts.get("exclude_regex", "")
+    label = opts.get("vehicle_label", "")
+    if not isinstance(regex, str) or len(regex) > MAX_REGEX_LEN or "\x00" in regex or "\n" in regex or "\r" in regex:
+        raise CtlError("bad_regex", "exclude_regex must be a single-line string up to %d chars" % MAX_REGEX_LEN)
+    if not isinstance(label, str) or not LABEL_RE.match(label):
+        raise CtlError("bad_label", "vehicle_label must match [A-Za-z0-9_-]{0,32}")
+    if not cfg["ros_setup"]:
+        raise CtlError("ros_not_configured", "no ros_setup configured in %s (run `qgc-bagctl doctor --json`)" % CONFIG_PATH)
+
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "start.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)       # serialize concurrent start requests
+    try:
+        act = active_session(cfg)
+        if act:
+            raise CtlError("already_recording", "session %s is already %s" % (act["session_id"], act["state"]), 3)
+        try:
+            os.makedirs(cfg["bag_root"], exist_ok=True)
+            if not os.access(cfg["bag_root"], os.W_OK):
+                raise OSError("not writable")
+        except OSError as e:
+            raise CtlError("bag_root_unwritable", "%s: %s" % (cfg["bag_root"], e))
+        fb = free_bytes(cfg["bag_root"])
+        required = cfg["min_free_bytes"] + STOP_HEADROOM_BYTES
+        if fb < required:
+            raise CtlError("disk_full", "only %d bytes free in %s (minimum %d)" % (fb, cfg["bag_root"], required))
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        sid = "%s-%s%s" % (ts, (label + "-") if label else "", secrets.token_hex(2))
+        bag = bag_path_for(cfg, sid)
+        if os.path.exists(bag):
+            raise CtlError("bag_exists", "refusing to overwrite %s" % bag)
+        m = {"session_id": sid, "state": "starting", "bag_path": bag, "exclude_regex": regex,
+             "vehicle_label": label, "started_at": now_iso(), "started_epoch": time.time(),
+             "stop_requested": False, "last_error": ""}
+        write_manifest(sid, m)
+        r = systemctl("start", "--no-block", unit_name(sid))
+        if r.returncode != 0:
+            m.update(state="failed", last_error="systemctl start failed: " + (r.stderr or r.stdout).strip())
+            write_manifest(sid, m)
+            raise CtlError("systemd_error", m["last_error"])
+        guard = systemctl("start", "--no-block", guard_unit_name(sid))
+        if guard.returncode != 0:
+            m.update(stop_requested=True, last_error="disk guard start failed: " + (guard.stderr or guard.stdout).strip())
+            write_manifest(sid, m)
+            systemctl("stop", "--no-block", unit_name(sid))
+            raise CtlError("systemd_error", m["last_error"])
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    return {"ok": True, "session_id": sid, "state": "starting", "bag_path": bag}, 0
+
+
+def cmd_run(args):
+    """ExecStart of the unit: build env, then exec ros2 directly (no shell parent, SIGINT reaches rosbag2)."""
+    cfg = load_config()
+    sid = check_session_id(args.session)
+    m = read_manifest(sid)
+    if not m or m.get("session_id") != sid:
+        raise CtlError("no_such_session", "unknown session " + sid)
+    bag = bag_path_for(cfg, sid)
+    if m.get("bag_path") != bag:
+        raise CtlError("path_mismatch", "manifest bag_path does not match configured bag root")
+    if os.path.exists(bag):
+        raise CtlError("bag_exists", "refusing to overwrite " + bag)
+    env = build_env(cfg)
+    argv = ["ros2", "bag", "record", "-a"]
+    regex = m.get("exclude_regex", "")
+    if regex:
+        argv += ["-x", regex]
+    argv += list(cfg["extra_record_args"]) + ["-o", bag]
+    exe = shutil.which("ros2", path=env.get("PATH"))
+    if not exe:
+        raise CtlError("ros2_missing", "ros2 not found after sourcing ros_setup")
+    log("exec %r" % (argv,))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(exe, argv, env)
+
+
+def cmd_guard(args):
+    """Run in a separate user unit so ros2 remains the recorder unit's main process."""
+    cfg = load_config()
+    sid = check_session_id(args.session)
+    stop_at = cfg["min_free_bytes"] + STOP_HEADROOM_BYTES
+    while True:
+        m = read_manifest(sid)
+        if not m:
+            raise CtlError("no_such_session", "unknown session " + sid)
+        if m.get("stop_requested") or not unit_is_live(unit_info(sid)):
+            return {"ok": True, "session_id": sid, "guard": "finished"}, 0
+        available = free_bytes(cfg["bag_root"])
+        if available <= stop_at:
+            log("disk guard stopping %s with %d bytes free" % (sid, available))
+            return cmd_stop(argparse.Namespace(id=sid))
+        time.sleep(5)
+
+
+def cmd_status(_args):
+    cfg = load_config()
+    sessions = all_sessions()
+    act = active_session(cfg)
+    last = None
+    for m in reversed(sessions):
+        r = resolve(cfg, m)
+        if r["state"] in ("finalized", "failed"):
+            last = r
+            break
+    cur = act or last
+    out = {"ok": True, "state": cur["state"] if cur else "idle", "active": act is not None,
+           "bag_root": cfg["bag_root"], "free_bytes": free_bytes(cfg["bag_root"]) if os.path.isdir(cfg["bag_root"]) else 0}
+    if cur:
+        out.update(cur)
+    else:
+        out.update({"session_id": "", "bag_path": "", "started_at": "", "last_error": ""})
+    if act and last:
+        out["last_session"] = last
+    return out, 0
+
+
+def cmd_stop(args):
+    cfg = load_config()
+    sid = check_session_id(args.id)
+    m = read_manifest(sid)
+    if not m:
+        raise CtlError("no_such_session", "unknown session " + sid)
+    r = resolve(cfg, m)
+    if r["state"] in ("starting", "recording"):
+        m = read_manifest(sid)
+        m["stop_requested"] = True
+        write_manifest(sid, m)
+        # SIGINT via the unit's KillSignal; returns immediately, status reports "stopping" until finalized.
+        systemctl("stop", "--no-block", unit_name(sid), check=True)
+        r = resolve(cfg, read_manifest(sid))
+    out = {"ok": True}
+    out.update(r)
+    return out, 0
+
+
+def cmd_list(_args):
+    cfg = load_config()
+    return {"ok": True, "sessions": [resolve(cfg, m) for m in reversed(all_sessions())]}, 0
+
+
+def cmd_manifest(args):
+    cfg = load_config()
+    sid = check_session_id(args.id)
+    m = read_manifest(sid)
+    if not m:
+        raise CtlError("no_such_session", "unknown session " + sid)
+    r = resolve(cfg, m)
+    if r["state"] != "finalized":
+        raise CtlError("not_finalized", "session is %s; only finalized bags can be downloaded. %s" % (r["state"], r["last_error"]), 4)
+    bag = os.path.realpath(r["bag_path"])
+    files = []
+    for root, _dirs, names in os.walk(bag):
+        for n in sorted(names):
+            full = os.path.join(root, n)
+            rel = os.path.relpath(full, bag).replace(os.sep, "/")
+            entry = {"path": rel, "size": os.path.getsize(full)}
+            if args.sha256:
+                h = hashlib.sha256()
+                with open(full, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                entry["sha256"] = h.hexdigest()
+            files.append(entry)
+    return {"ok": True, "session_id": sid, "bag_path": r["bag_path"], "files": files,
+            "total_bytes": sum(f["size"] for f in files)}, 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="qgc-bagctl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("doctor", "start", "status", "list"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("stop")
+    sp.add_argument("--id", required=True)
+    sp.add_argument("--json", action="store_true")
+    sp = sub.add_parser("manifest")
+    sp.add_argument("--id", required=True)
+    sp.add_argument("--sha256", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    for name in ("run", "guard"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--session", required=True)
+    args = p.parse_args(argv)
+
+    handlers = {"doctor": cmd_doctor, "start": cmd_start, "status": cmd_status, "stop": cmd_stop,
+                "list": cmd_list, "manifest": cmd_manifest, "run": cmd_run, "guard": cmd_guard}
+    try:
+        result, code = handlers[args.cmd](args)
+    except CtlError as e:
+        log("%s: %s" % (e.code, e.message))
+        print(json.dumps({"ok": False, "error_code": e.code, "message": e.message}))
+        return e.exit_code
+    except Exception as e:  # never emit a traceback instead of JSON
+        log("unexpected error: %r" % (e,))
+        print(json.dumps({"ok": False, "error_code": "internal_error", "message": str(e)}))
+        return 70
+    print(json.dumps(result))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -64,6 +64,24 @@ tar-build.bat build      incremental build
 Output: `build\RelWithDebInfo\QlaudeGC.exe` (see the build log for the exact path) and
 `build\tar_router_cli.exe`. Test the router: `python custom\test\router_test.py build\tar_router_cli.exe`.
 
+## ROS 2 bag recording (Jetson)
+
+Toolbar button **Start recording bag** starts `ros2 bag record -a [-x <regex>]` on the Jetson; it then
+becomes **Stop recording bag** (with a confirmation). Click the status text for the details drawer:
+Stop, Stop and download, Download bag, settings (host, user, key, regex, download folder) and a Jetson check.
+
+- **Design.** QGC runs `ssh.exe` (key auth, `StrictHostKeyChecking=yes`, `BatchMode=yes`) with a fixed remote command
+  (`qgc-bagctl`). The recorder runs as a `systemd --user` service on the Jetson, so closing QGC, SSH or NoMachine
+  does not stop it. QGC rediscovers a running recording on launch and after network drops.
+- **State.** "Recording" is shown only when the Jetson reports it. SSH failures show "unknown", never "stopped".
+- **Download.** After stop and finalization, `scp -r` copies the bag into `.incomplete-<id>`, checks it against a
+  server-side file list (names and sizes, optional SHA-256), then renames it to `qgc-<id>`. Nothing is deleted on the Jetson.
+- **Setup.** Install `jetson/qgc-bagctl` on the Jetson first: see `jetson/SETUP.md`. Settings live under the
+  `TarBagRecorder` QSettings group.
+- **Troubleshooting.** Use "Run Jetson check" in the drawer, or `ssh -T -o BatchMode=yes <user>@<host> '~/.local/bin/qgc-bagctl doctor --json'`.
+  Host-key and auth errors are shown verbatim in the drawer; fix them with a one-time manual `ssh` login.
+- **Tests.** `python3 -m unittest jetson/test_qgc_bagctl.py -v` (Jetson side, no ROS needed).
+
 ## Updating QGC
 
 The custom code only touches public QGC APIs (`QGCCorePlugin`, `LinkManager`, `UDPConfiguration`), so

@@ -1,0 +1,15 @@
+[Unit]
+Description=QGC ROS 2 bag recording (%i)
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/qgc-bagctl run --session %i
+# Graceful stop: SIGINT to ros2 bag record so it flushes and writes metadata.yaml.
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=120
+# Never SIGKILL a recorder that is still flushing; an overrun is reported by status as an error instead.
+SendSIGKILL=no
+Restart=no
+StandardOutput=append:%h/.local/state/qgc-bagctl/sessions/%i/recorder.log
+StandardError=append:%h/.local/state/qgc-bagctl/sessions/%i/recorder.log

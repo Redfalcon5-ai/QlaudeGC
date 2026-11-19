@@ -1,0 +1,14 @@
+{
+  "bag_root": "~/rosbags",
+  "ros_setup": [
+    "/opt/ros/<ROS_DISTRO>/setup.bash",
+    "/home/<USER>/<WORKSPACE>/install/setup.bash"
+  ],
+  "env": {
+    "ROS_DOMAIN_ID": "<same value as your working NoMachine terminal>",
+    "RMW_IMPLEMENTATION": "<same value as your working terminal, or remove this line>"
+  },
+  "min_free_bytes": 5368709120,
+  "extra_record_args": [],
+  "stop_timeout_s": 120
+}
